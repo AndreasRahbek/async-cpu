@@ -1,59 +1,155 @@
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tokio::task;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::mem::MaybeUninit;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::Foundation::FILETIME;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
-const SIZE: usize = 1000;
-const NUM_TASKS: usize = 8;
 
-#[tokio::main]
-async fn main() {
-    let a = Arc::new(vec![vec![1.0; SIZE]; SIZE]);
-    let b = Arc::new(vec![vec![1.0; SIZE]; SIZE]);
-    let result = Arc::new(Mutex::new(vec![vec![0.0; SIZE]; SIZE]));
+fn filetime_to_duration(ft: FILETIME) -> Duration {
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+    Duration::from_nanos(ticks * 100)
+}
+/// Læs aktuelt RAM-forbrug (Working Set) i bytes
+unsafe fn get_memory_counters() -> PROCESS_MEMORY_COUNTERS_EX {
+    let mut pmc = MaybeUninit::<PROCESS_MEMORY_COUNTERS_EX>::zeroed();
+    let handle = GetCurrentProcess();
+    // Henter WorkingSetSize, PeakWorkingSetSize, PrivateUsage, PagefileUsage mm.
+    GetProcessMemoryInfo(
+        handle,
+        pmc.as_mut_ptr() as *mut _,
+        std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+    )
+        .ok()
+        .expect("Kunne ikke hente hukommelsesinfo");
+    pmc.assume_init()
+}
 
-    let start = Instant::now();
+fn get_cpu_time() -> Duration {
+    unsafe {
+        let mut creation = MaybeUninit::uninit();
+        let mut exit = MaybeUninit::uninit();
+        let mut kernel = MaybeUninit::uninit();
+        let mut user = MaybeUninit::uninit();
+
+        let handle = GetCurrentProcess();
+        let result = GetProcessTimes(
+            handle,
+            creation.as_mut_ptr(),
+            exit.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        );
+
+        if result.is_ok() {
+            let kernel = filetime_to_duration(kernel.assume_init());
+            let user   = filetime_to_duration(user.assume_init());
+            kernel + user
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+/// Læs billede, konverter til gråtoner, og gem i output-mappe
+fn process_image(path: &Path, output_dir: &Path) {
+    let img = image::open(path).expect("Kunne ikke åbne billede");
+    let mut gray = img.grayscale();
+
+    // Gør billedbehandlingen tungere med fx blur og kontrast mange gange
+    for _ in 0..5 {
+        gray = gray.blur(1.0);         // Sløret billede
+    }
+
+    let filename = path.file_name().unwrap();
+    let output_path = output_dir.join(filename);
+    gray.save_with_format(output_path, image::ImageFormat::Jpeg)
+        .expect("Kunne ikke gemme billede");
+}
+
+/// Læser alle .jpg filer i input-mappen
+fn get_image_paths() -> Vec<std::path::PathBuf> {
+    let input_dir = Path::new("images/input");
+    fs::read_dir(input_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "jpeg").unwrap_or(false))
+        .collect()
+}
+async fn run_async(image_paths: Vec<std::path::PathBuf>) {
+    let total = image_paths.len();
+    let mid = total / 2;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let output_dir = Arc::new(PathBuf::from("images/output"));
 
     let mut handles = vec![];
-    let chunk_size = SIZE / NUM_TASKS;
 
-    for task_id in 0..NUM_TASKS {
-        let a = Arc::clone(&a);
-        let b = Arc::clone(&b);
-        let result = Arc::clone(&result);
+    for path in image_paths {
+        let output_dir = Arc::clone(&output_dir);
+        let counter = Arc::clone(&counter);
+        let path = path.clone();
 
-        let handle = task::spawn_blocking(move || {
-            let start_row = task_id * chunk_size;
-            let end_row = if task_id == NUM_TASKS - 1 {
-                SIZE
-            } else {
-                (task_id + 1) * chunk_size
-            };
+        let handle = tokio::spawn(async move {
+            // Kald tung CPU-funktion direkte (ideelt set burde denne være offloaded via tokio::task::spawn_blocking)
+            process_image(&path, &output_dir);
+            let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-            let mut local_result = vec![vec![0.0; SIZE]; SIZE];
-
-            for i in start_row..end_row {
-                for j in 0..SIZE {
-                    for k in 0..SIZE {
-                        local_result[i][j] += a[i][k] * b[k][j];
-                    }
-                }
-            }
-
-            let mut result = result.lock().unwrap();
-            for i in start_row..end_row {
-                for j in 0..SIZE {
-                    result[i][j] = local_result[i][j];
-                }
+            // RAM-målinger ved 10, midtvejs og tæt på slut
+            if done == 10 || done == mid || done == total - 10 {
+                let mem = unsafe { get_memory_counters() };
+                let phase = match done {
+                    10 => "Start",
+                    x if x == mid => "Midtvejs",
+                    x if x == total - 10 => "Slutning",
+                    _ => unreachable!(),
+                };
+                println!("-- Måling ({}) efter {} billeder --", phase, done);
+                println!("WorkingSetSize: {} MB", mem.WorkingSetSize / 1_048_576);
+                println!("PrivateUsage:   {} MB", mem.PrivateUsage   / 1_048_576);
+                println!("PeakPagefile:   {} MB", mem.PagefileUsage  / 1_048_576);
             }
         });
-
         handles.push(handle);
     }
 
-    for handle in handles {
-        handle.await.unwrap();
+    for h in handles {
+        let _ = h.await;
     }
-
-    let duration = start.elapsed();
-    println!("Time taken (Tokio async with spawn_blocking): {:?}", duration);
 }
+
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let logical_cores = 1;
+
+    let wall_start = Instant::now();
+    let cpu_start = get_cpu_time();
+
+    run_async(get_image_paths()).await;
+
+    //CPU
+    let wall_elapsed = wall_start.elapsed();
+    let cpu_end = get_cpu_time();
+    let cpu_used = cpu_end - cpu_start;
+
+    let cpu_percent_one_core = (cpu_used.as_secs_f64() / wall_elapsed.as_secs_f64()) * 100.0;
+    let cpu_percent_all_cores = cpu_percent_one_core / logical_cores as f64;
+
+    //RAM
+    let mem_end      = unsafe { get_memory_counters() };
+    let peak_ws    = mem_end.PeakWorkingSetSize    / 1_048_576;
+
+    println!("");
+    println!("2) Async færdig på: {:.2?}", wall_elapsed);
+    println!("");
+    println!("=== CPU Forbrug ===");
+    println!("CPU time:  {:.2?}", cpu_used);
+    println!("CPU usage (1 kerne): {:.2}%", cpu_percent_one_core);
+    println!("CPU usage ift. samlet kapacitet (alle kerner): {:.2}%", cpu_percent_all_cores);
+    println!("");
+    println!("=== RAM-Forbrug ===");
+    println!("Spidsværdi: {} MB", peak_ws);
+}
+
